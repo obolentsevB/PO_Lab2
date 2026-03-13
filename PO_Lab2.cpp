@@ -3,53 +3,88 @@
 #include <chrono>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <climits>
+#include <iomanip>
 
-std::mutex mtx;
+const int NUM_THREADS = 6;
+const int DATA_SIZE = 10000000;
 
-void locked_task(const std::vector<int>& data, int start, int end, long long& global_sum, int& global_min) {
-    long long local_sum = 0;
-    int local_min = INT_MAX;
-
-    for (int i = start; i < end; ++i) {
-        if (data[i] % 11 == 0) {
-            local_sum += data[i];
-            if (data[i] < local_min) local_min = data[i];
+void sequential_task(const std::vector<int>& data, long long& sum, int& min_val) {
+    sum = 0;
+    min_val = INT_MAX;
+    for (int x : data) {
+        if (x % 11 == 0) {
+            sum += x;
+            if (x < min_val) min_val = x;
         }
     }
+}
 
-    // Блокуюча синхронізація для оновлення спільних ресурсів
-    std::lock_guard<std::mutex> lock(mtx);
-    global_sum += local_sum;
-    if (local_min < global_min) global_min = local_min;
+std::mutex mtx;
+void locked_task_in_loop(const std::vector<int>& data, int start, int end, long long& sum, int& min_val) {
+    for (int i = start; i < end; ++i) {
+        if (data[i] % 11 == 0) {
+            std::lock_guard<std::mutex> lock(mtx); 
+            sum += data[i];
+            if (data[i] < min_val) min_val = data[i];
+        }
+    }
+}
+
+void atomic_cas_task(const std::vector<int>& data, int start, int end, std::atomic<long long>& sum, std::atomic<int>& min_val) {
+    for (int i = start; i < end; ++i) {
+        if (data[i] % 11 == 0) {
+            int val = data[i];
+            long long current_sum = sum.load();
+            while (!sum.compare_exchange_weak(current_sum, current_sum + val)) {} 
+
+            int current_min = min_val.load();
+            while (val < current_min && !min_val.compare_exchange_weak(current_min, val)) {} 
+        }
+    }
 }
 
 int main() {
-    const int DATA_SIZE = 1000000;
-    const int NUM_THREADS = 6;
     std::vector<int> data(DATA_SIZE);
     for (int i = 0; i < DATA_SIZE; ++i) data[i] = rand() % 1000;
 
-    // 1. Послідовно
-    long long seq_sum = 0;
-    int seq_min = INT_MAX;
-    auto start_seq = std::chrono::high_resolution_clock::now();
-    for (int x : data) { if (x % 11 == 0) { seq_sum += x; if (x < seq_min) seq_min = x; } }
-    auto end_seq = std::chrono::high_resolution_clock::now();
+    long long seq_sum; int seq_min;
+    auto s_start = std::chrono::high_resolution_clock::now();
+    sequential_task(data, seq_sum, seq_min);
+    auto s_end = std::chrono::high_resolution_clock::now();
+    double t_seq = std::chrono::duration<double>(s_end - s_start).count();
 
-    // 2. З м'ютексом
-    long long lock_sum = 0;
-    int lock_min = INT_MAX;
+    long long lock_sum = 0; int lock_min = INT_MAX;
     std::vector<std::thread> threads;
-    auto start_lock = std::chrono::high_resolution_clock::now();
+    int chunk = DATA_SIZE / NUM_THREADS;
+    auto m_start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < NUM_THREADS; ++i) {
-        threads.emplace_back(locked_task, std::ref(data), i * (DATA_SIZE / NUM_THREADS), (i + 1) * (DATA_SIZE / NUM_THREADS), std::ref(lock_sum), std::ref(lock_min));
+        int start = i * chunk;
+        int end = (i == NUM_THREADS - 1) ? DATA_SIZE : (i + 1) * chunk;
+        threads.emplace_back(locked_task_in_loop, std::ref(data), start, end, std::ref(lock_sum), std::ref(lock_min));
     }
     for (auto& t : threads) t.join();
-    auto end_lock = std::chrono::high_resolution_clock::now();
+    auto m_end = std::chrono::high_resolution_clock::now();
+    double t_lock = std::chrono::duration<double>(m_end - m_start).count();
 
-    std::cout << "Sequential: Sum=" << seq_sum << ", Min=" << seq_min << ", Time=" << std::chrono::duration<double>(end_seq - start_seq).count() << "s\n";
-    std::cout << "Mutex: Sum=" << lock_sum << ", Min=" << lock_min << ", Time=" << std::chrono::duration<double>(end_lock - start_lock).count() << "s\n";
+    std::atomic<long long> atom_sum(0);
+    std::atomic<int> atom_min(INT_MAX);
+    threads.clear();
+    auto a_start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        int start = i * chunk;
+        int end = (i == NUM_THREADS - 1) ? DATA_SIZE : (i + 1) * chunk;
+        threads.emplace_back(atomic_cas_task, std::ref(data), start, end, std::ref(atom_sum), std::ref(atom_min));
+    }
+    for (auto& t : threads) t.join();
+    auto a_end = std::chrono::high_resolution_clock::now();
+    double t_atom = std::chrono::duration<double>(a_end - a_start).count();
+
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "Sequential: Time=" << t_seq << "s\n";
+    std::cout << "Mutex (In Loop): Acceleration=" << (t_seq / t_lock) << "x (Time: " << t_lock << "s)\n";
+    std::cout << "Atomic CAS: Acceleration=" << (t_seq / t_atom) << "x (Time: " << t_atom << "s)\n";
 
     return 0;
 }
